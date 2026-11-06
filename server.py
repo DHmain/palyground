@@ -90,7 +90,7 @@ class Game:
         return d
 
     def members(self, team):
-        return [token for token, p in self.players.items() if p['team'] == team and token != self.host]
+        return [token for token, p in self.players.items() if p['team'] == team]
 
     def assigned(self, token):
         if token not in self.players:
@@ -99,6 +99,8 @@ class Game:
         return next((x for x in self.teams if x['id'] == t), None)
 
     def roles(self, n):
+        if n == 1:
+            return [['U', 'D', 'L', 'R']]
         return [['U', 'D'], ['L', 'R']] if n == 2 else ([['U', 'D'], ['L'], ['R']] if n == 3 else [['U'], ['D'], ['L'], ['R']])
 
     def rope_beat(self, index, team=None):
@@ -129,8 +131,8 @@ class Game:
     def begin(self):
         if self.phase == 'lobby':
             active = [i for i in range(self.team_count) if self.members(i)]
-            if len(active) < 2 or any(not 2 <= len(self.members(i)) <= 4 for i in active):
-                raise ValueError('참여 조가 2개 이상이며 각 조에 2~4명이 있어야 합니다.')
+            if not active or any(not 1 <= len(self.members(i)) <= 4 for i in active):
+                raise ValueError('한 개 이상의 조에 참여해 주세요. 각 조는 1~4명으로 진행할 수 있습니다.')
             self.teams = [{'id': i, 'members': self.members(i), 'score': 0, 'history': []} for i in active]
             self.prepare_courses()
             self.stage = 0
@@ -147,7 +149,7 @@ class Game:
             while len(order) < 8:
                 batch = t['members'][:]
                 random.shuffle(batch)
-                if order and batch[0] == order[-1]:
+                if len(batch) > 1 and order and batch[0] == order[-1]:
                     batch[0], batch[1] = batch[1], batch[0]
                 order.extend(batch)
             t['order'] = order[:8]
@@ -351,20 +353,18 @@ class Game:
                 raise ValueError('사회자는 대기실에서 한 명만 설정할 수 있습니다.')
             if not secrets.compare_digest(str(data.get('pin', '')).upper(), self.pin):
                 raise ValueError('사회자 PIN이 일치하지 않습니다.')
-            self.host, p['team'] = token, None
+            self.host = token
         elif action in ('team', 'spectate'):
             if self.phase != 'lobby':
                 raise ValueError('경기 중에는 조를 변경할 수 없습니다.')
             if action == 'spectate':
                 p['team'] = None
-                if self.host == token:
-                    self.host = None
             else:
                 i = int(data['team'])
-                if token == self.host or not 0 <= i < self.team_count or (p['team'] != i and len(self.members(i)) >= 4):
-                    raise ValueError('해당 조에 참여할 수 없습니다. 사회자는 먼저 대기 인원으로 이동하세요.')
+                if not 0 <= i < self.team_count or (p['team'] != i and len(self.members(i)) >= 4):
+                    raise ValueError('해당 조에 참여할 수 없습니다. 빈자리가 있는 조를 선택하세요.')
                 p['team'] = i
-        elif action in ('shuffle', 'count', 'start', 'pause', 'reset', 'add_ai', 'remove_ai', 'clear_ai'):
+        elif action in ('shuffle', 'count', 'start', 'start_play', 'take_ai', 'pause', 'reset', 'add_ai', 'remove_ai', 'clear_ai'):
             if token != self.host:
                 raise ValueError('사회자만 사용할 수 있습니다.')
             if action in ('shuffle', 'count', 'add_ai', 'remove_ai', 'clear_ai') and self.phase != 'lobby':
@@ -395,18 +395,47 @@ class Game:
                     if q['team'] is not None and q['team'] >= n:
                         q['team'] = None
             elif action == 'shuffle':
-                pool = [k for k, q in self.players.items() if k != self.host and (q.get('ai') or time.monotonic() - q['seen'] < 15)]
-                if not 2 * self.team_count <= len(pool) <= 4 * self.team_count:
-                    raise ValueError('접속 인원에 맞춰 조 수를 선택하세요. 각 조는 2~4명입니다.')
+                pool = [k for k, q in self.players.items()
+                        if (k != self.host or q['team'] is not None)
+                        and (q.get('ai') or time.monotonic() - q['seen'] < 15)]
+                if not 1 <= len(pool) <= 4 * self.team_count:
+                    raise ValueError('배정할 참가자가 필요합니다. 각 조는 1~4명입니다. 사회자도 조에 참여할 수 있습니다.')
                 random.shuffle(pool)
                 for q in self.players.values():
                     q['team'] = None
                 for j, k in enumerate(pool):
                     self.players[k]['team'] = j % self.team_count
-            elif action == 'start':
+            elif action == 'take_ai':
+                if self.phase != 'playing' or self.assigned(token) is not None:
+                    raise ValueError('경기 중 관전 상태에서만 AI 자리를 넘겨받을 수 있습니다.')
+                candidates = [t for t in self.teams if not t['completed']]
+                target = next(((t, k) for t in candidates for k in t['members'] if self.players[k].get('ai')), None)
+                if target is None:
+                    raise ValueError('넘겨받을 AI 자리가 없습니다. 대기실에서 조에 참여해 주세요.')
+                t, bot = target
+                p['team'] = t['id']
+                t['members'] = [token if k == bot else k for k in t['members']]
+                t['order'] = [token if k == bot else k for k in t['order']]
+                t['successes'] = [token if k == bot else k for k in t['successes']]
+                if bot in t['used']:
+                    t['used'][token] = t['used'].pop(bot)
+                del self.players[bot]
+                t['feedback'] = p['name'] + ' 참가 · AI 자리 인계'
+            elif action in ('start', 'start_play'):
                 if self.paused:
                     raise ValueError('일시정지를 먼저 해제하세요.')
-                self.begin()
+                original_team = p['team']
+                if action == 'start_play' and self.phase == 'lobby' and original_team is None:
+                    available = [i for i in range(self.team_count) if len(self.members(i)) < 4]
+                    if not available:
+                        raise ValueError('빈자리가 없습니다. AI를 한 명 제거한 뒤 참가해 주세요.')
+                    # Prefer an occupied team so the host can cooperate with existing players.
+                    p['team'] = next((i for i in available if self.members(i)), available[0])
+                try:
+                    self.begin()
+                except Exception:
+                    p['team'] = original_team
+                    raise
             elif action == 'pause':
                 if self.phase != 'playing':
                     raise ValueError('경기 중에만 일시정지할 수 있습니다.')
@@ -495,6 +524,7 @@ class Handler(BaseHTTPRequestHandler):
                 body = (ROOT / 'index.html').read_bytes()
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Cache-Control', 'no-store')
                 self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)

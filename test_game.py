@@ -114,23 +114,25 @@ class GameTest(unittest.TestCase):
             dx, dy = server.DIRECTIONS[key]
             self.assertEqual(t['pos'], [x + dx, y + dy])
 
-    def setup_game(self, sizes=(4, 4, 4, 4, 4)):
+    def setup_game(self, sizes=(4, 4, 4, 4, 4), host_playing=False):
         g = server.Game()
         clock = [0.0]
         g.now = lambda: clock[0]
         host = g.act(None, {'action': 'join', 'name': '사회자'})['token']
         g.act(host, {'action': 'host', 'pin': g.pin})
+        if host_playing:
+            g.act(host, {'action': 'team', 'team': 0})
         for team, n in enumerate(sizes):
-            for i in range(n):
+            for i in range(n - (1 if host_playing and team == 0 else 0)):
                 k = g.act(None, {'action': 'join', 'name': f'{team}-{i}'})['token']
                 g.act(k, {'action': 'team', 'team': team})
         g.begin()
         return g, clock, host
 
-    def test_all_stages_with_20_players(self):
-        g, clock, host = self.setup_game()
-        self.assertEqual(len(g.players), 21)
-        self.assertIsNone(g.players[host]['team'])
+    def test_all_stages_with_20_players(self, host_playing=False, sizes=(4, 4, 4, 4, 4)):
+        g, clock, host = self.setup_game(sizes=sizes, host_playing=host_playing)
+        self.assertEqual(len(g.players), sum(sizes) + (0 if host_playing else 1))
+        self.assertEqual(g.players[host]['team'], 0 if host_playing else None)
         # Each team solves its own maze using the assigned direction owners.
         clock[0] = g.start
         for t in g.teams:
@@ -184,6 +186,117 @@ class GameTest(unittest.TestCase):
         self.assertEqual(g.phase, 'results')
         self.assertTrue(all(t['health'] == 0 for t in g.teams))
         self.assertTrue(all(len(t['history']) == 4 for t in g.teams))
+
+    def test_host_can_play_all_stages(self):
+        self.test_all_stages_with_20_players(host_playing=True)
+
+    def test_start_play_enrolls_host_and_accepts_input(self):
+        g, clock, host = self.ai_lobby()
+        g.act(host, {'action': 'start_play'})
+        self.assertEqual(g.members(0), [host])
+        state = g.public(host)
+        self.assertEqual(state['my_team'], state['active_team'])
+        self.assertEqual(state['my_slot'], 0)
+        clock[0] = g.start
+        t = g.teams[0]
+        x, y = t['pos']
+        key = next(k for k, (dx, dy) in server.DIRECTIONS.items()
+                   if t['distances'].get((x+dx, y+dy)) == t['distances'][(x, y)]-1)
+        g.act(host, {'action': 'input', 'key': key, 'round': g.round_id})
+        self.assertNotEqual(t['pos'], [x, y])
+
+    def test_host_can_take_ai_without_resetting_game(self):
+        for stage in range(4):
+            with self.subTest(stage=stage):
+                g, clock, host = self.ai_lobby()
+                g.act(host, {'action': 'add_ai', 'team': 0})
+                g.act(host, {'action': 'start'})
+                g.stage = stage
+                t = g.teams[0]
+                bot = t['members'][0]
+                # Preserve consumed attempts and prior successes at takeover.
+                t['used'][bot] = 0
+                t['successes'] = [bot]
+                old_round, old_start = g.round_id, g.start
+                g.act(host, {'action': 'take_ai'})
+                self.assertEqual(t['members'], [host])
+                self.assertTrue(all(k == host for k in t['order']))
+                self.assertEqual(t['successes'], [host])
+                self.assertEqual(t['used'][host], 0)
+                self.assertNotIn(bot, g.players)
+                self.assertEqual((g.round_id, g.start), (old_round, old_start))
+                self.assertEqual(g.public(host)['my_slot'], 0)
+                with self.assertRaises(ValueError):
+                    g.act(host, {'action': 'take_ai'})
+
+    def test_start_play_preserves_roster_when_full(self):
+        g, clock, host = self.ai_lobby()
+        g.act(host, {'action': 'count', 'count': 2})
+        for team in (0, 1):
+            for _ in range(4):
+                g.act(host, {'action': 'add_ai', 'team': team})
+        with self.assertRaises(ValueError):
+            g.act(host, {'action': 'start_play'})
+        self.assertEqual(g.phase, 'lobby')
+        self.assertIsNone(g.players[host]['team'])
+        self.assertEqual([len(g.members(i)) for i in (0, 1)], [4, 4])
+
+    def test_small_rosters_complete_all_stages(self):
+        # Drive human inputs through every stage, including the participating host.
+        for sizes in ((1,), (2,), (3,), (1, 1), (2, 1), (1, 2), (1, 1, 1), (3, 3)):
+            with self.subTest(sizes=sizes):
+                self.test_all_stages_with_20_players(host_playing=True, sizes=sizes)
+
+    def test_small_roster_shuffle_and_ai(self):
+        self.assertEqual(server.Game().roles(1), [['U', 'D', 'L', 'R']])
+        for total in (1, 2, 3):
+            with self.subTest(total=total):
+                g, clock, host = self.ai_lobby()
+                with self.assertRaises(ValueError):
+                    g.act(host, {'action': 'start'})
+                for _ in range(total):
+                    g.act(host, {'action': 'add_ai', 'team': 0})
+                g.act(host, {'action': 'shuffle'})
+                self.assertEqual(sum(len(g.members(i)) for i in range(g.team_count)), total)
+                for stage in range(4):
+                    g.act(host, {'action': 'start'})
+                    for _ in range(30001):
+                        g.tick()
+                        if g.phase == 'results':
+                            break
+                        clock[0] += .02
+                    self.assertEqual(g.phase, 'results')
+                    self.assertTrue(all(t['finish'] is not None for t in g.teams), stage)
+
+    def test_host_team_management_and_authority(self):
+        g, clock, host = self.ai_lobby()
+        g.act(host, {'action': 'count', 'count': 2})
+        g.act(host, {'action': 'team', 'team': 0})
+        for team in (0, 1, 1):
+            g.act(host, {'action': 'add_ai', 'team': team})
+        state = g.public(host)
+        self.assertTrue(state['host'])
+        self.assertEqual(len(state['lobby'][0]), 2)
+        g.act(host, {'action': 'shuffle'})
+        self.assertIsNotNone(g.players[host]['team'])
+        self.assertEqual([len(g.members(i)) for i in range(2)], [2, 2])
+        g.act(host, {'action': 'start'})
+        self.assertIsNotNone(g.public(host)['my_slot'])
+        g.act(host, {'action': 'pause'})
+        self.assertTrue(g.paused)
+        g.act(host, {'action': 'pause'})
+        self.assertFalse(g.paused)
+        g.act(host, {'action': 'reset'})
+        g.act(host, {'action': 'spectate'})
+        self.assertEqual(g.host, host)
+        self.assertIsNone(g.players[host]['team'])
+        g.act(host, {'action': 'count', 'count': 3})
+        self.assertEqual(g.team_count, 3)
+        # Claiming the host seat does not remove an existing team assignment.
+        g.host = None
+        g.act(host, {'action': 'team', 'team': 0})
+        g.act(host, {'action': 'host', 'pin': g.pin})
+        self.assertEqual(g.players[host]['team'], 0)
 
     def test_balancing_and_authority(self):
         g, clock, host = self.setup_game((2, 3, 4))
